@@ -8241,9 +8241,10 @@ const MPX = (() => {
   const monthName = m => ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"][(m % 100) - 1] + " " + Math.floor(m / 100);
   /* MP-LIVE-UI */
   // ---- Live-Raid (11.11.): Lobby ueber den Server (Firestore, gleicher Weg wie der Online-Abgleich), alle rechnen den Kampf selbst nach ----
-  // Dokumente unter runden/{Kennung}/karten: Lp-RAUM-ID = Spieler (Schnappschuss, Bereit, gewaehlte Haltungen), Lg-RAUM = Host (Start, Seed, Protokoll). Der Host schliesst die Runden.
+  // Dokumente unter live/{Kennung}/m (eigene Regel noetig): Lp-RAUM-ID = Spieler (Schnappschuss, Bereit, gewaehlte Haltungen), Lg-RAUM = Host (Start, Seed, Protokoll). Der Host schliesst die Runden.
   const LV = { room: "", host: false, p: {}, g: null, st: null, me: { a: {}, rd: 0 }, busy: false, err: "", sig: "", tick: 0, roundSeen: 0, roundAt: 0, paid: "" };
-  const lvUrl = (r, id) => fbBase(r) + "/" + id + "?key=" + encodeURIComponent(FB.apiKey);
+  const lvBase = r => fbBase(r).replace("/runden/", "/live/").replace(/\/karten$/, "/m");
+  const lvUrl = (r, id) => lvBase(r) + "/" + id + "?key=" + encodeURIComponent(FB.apiKey);
   const lvHdr = { "Content-Type": "application/json" };
   async function lvPut(r, id, type, obj) {
     const res = await fetch(lvUrl(r, id), { method: "PATCH", headers: lvHdr, body: JSON.stringify({ fields: { code: { stringValue: MP.pack(type, obj, r.key) }, t: { integerValue: String(now()) }, rm: { stringValue: LV.room } } }) });
@@ -8251,9 +8252,9 @@ const MPX = (() => {
   }
   async function lvDel(r, id) { try { await fetch(lvUrl(r, id), { method: "DELETE" }); } catch (e) {} }
   async function lvFetch(r) {
-    const base = fbBase(r), q = "key=" + encodeURIComponent(FB.apiKey); let docs = null;
+    const base = lvBase(r), q = "key=" + encodeURIComponent(FB.apiKey); let docs = null;
     try {
-      const res = await fetch(base.replace(/\/karten$/, "") + ":runQuery?" + q, { method: "POST", headers: lvHdr, body: JSON.stringify({ structuredQuery: { from: [{ collectionId: "karten" }], where: { fieldFilter: { field: { fieldPath: "rm" }, op: "EQUAL", value: { stringValue: LV.room } } } } }) });
+      const res = await fetch(base.replace(/\/m$/, "") + ":runQuery?" + q, { method: "POST", headers: lvHdr, body: JSON.stringify({ structuredQuery: { from: [{ collectionId: "m" }], where: { fieldFilter: { field: { fieldPath: "rm" }, op: "EQUAL", value: { stringValue: LV.room } } } } }) });
       if (res.ok) docs = (await res.json()).map(x => x.document).filter(Boolean);
     } catch (e) {}
     if (!docs) { const res = await fetch(base + "?pageSize=300&" + q); if (!res.ok) throw new Error("Abrufen " + res.status); docs = (await res.json()).documents || []; }
@@ -8350,7 +8351,7 @@ const MPX = (() => {
     if (!st) return head + err + "<p>Kampf wird geladen …</p>";
     const B = st.boss, inP = lvInParty(), me = st.p.find(p => p.i === lvId()), myA = LV.me.a[g.rnd];
     let h = head + "<p><b>" + esc(B.n) + "</b> · Raum " + esc(LV.room) + "</p>" + err + '<div class="mpbar" aria-label="Boss-TP"><i style="width:' + Math.round(100 * B.hp / B.max) + '%"></i></div><p class="note">Boss ' + B.hp + " / " + B.max + " TP, RK " + B.ac + ", " + B.na + " Angriffe</p>" +
-      '<table class="mpt">' + st.p.map(p => row(p.n + (p.i === lvId() ? " (du)" : ""), p.hp > 0 ? "" : "am Boden", p.hp + " / " + p.max + " TP")).join("") + "</table>";
+      '<table class="mpt">' + st.p.map(p => row(p.n + (p.i === lvId() ? " (du)" : ""), cName(((g.party.find(q => q.i === p.i) || {}).s || {}).c) + (p.hp > 0 ? "" : ", am Boden"), p.hp + " / " + p.max + " TP")).join("") + "</table>";
     if (!st.end) {
       h += "<p><b>Runde " + g.rnd + "</b> · noch <span id=\"mpTm\">" + MP.LIVE_TIME / 1000 + "</span> s</p>";
       if (inP && me && me.hp > 0) h += '<div class="row">' + Object.entries(MP.STANCES).map(([k, v]) => '<button data-a="lact" data-s="' + k + '" aria-pressed="' + (myA === k) + '">' + v + "</button>").join("") + '</div><p class="note">' + (myA ? "Gewählt: " + MP.STANCES[myA] + ". Der Host wertet die Runde aus, sobald alle gewählt haben oder die Zeit abläuft (dann gilt Ausgewogen)." : "Angriff: +2 Treffer, −2 RK. Vorsicht: −2 Treffer, +2 RK.") + "</p>";
