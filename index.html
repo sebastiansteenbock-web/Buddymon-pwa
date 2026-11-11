@@ -7933,7 +7933,43 @@ const MP = (() => {
     apply(best); fmt(best);
     return { size, ver, m };
   }
-  return { sha256, hmac, utf8, unutf8, hex, unhex, b64u, unb64u, keyFrom, groupId, pack, unpack, rng, hash32, weekId, monthId, prevMonthId, snapOk, STANCES, duel, bossStats, bossFight, BOSS_PTS_MAX, cardOk, raidFoe, raidRun, raidState, RAID_MIN, RAID_POOL, RAID_ROOMS, ranking, sortBy, groupTotals, BRIEF_TAGE, serial, qr };
+  /* MP-LIVE-CORE */
+  // ---- Live-Raid (11.11.): 2 bis 4 Spieler gleichzeitig gegen einen Boss. Rundenweise, jeder waehlt je Runde eine Haltung. Zustand = Seed + Aktionsprotokoll, alle rechnen gleich ----
+  const LIVE_MIN = 2, LIVE_MAX = 4, LIVE_ROUNDS = 20, LIVE_TIME = 20000, LIVE_KOSTEN = 10, LIVE_HPF = [0, 1, 2.6, 3.9, 5.2];
+  function liveInit(party, seed, wk, bossName) {
+    const n = party.length, L = Math.max(1, Math.round(party.reduce((a, p) => a + p.s.l, 0) / n)), b = bossStats(L, wk);
+    const ps = party.map(p => { const f = fighter(p.s, "b", 99); return { i: p.i, n: p.n || p.s.n || p.s.c, hp: f.hpMax, max: f.hpMax, ac: p.s.ac, ab: p.s.ab, na: p.s.na, dd: p.s.dd, dm: p.s.dm, h: "b" }; });
+    const hp = Math.round(b.hp * LIVE_HPF[n]);
+    return { seed, rnd: 1, end: null, p: ps, boss: { n: bossName || "Boss", hp, max: hp, ac: b.ac, ab: b.ab, na: b.na + n - 1, dd: b.dd, dm: b.dm }, lines: [] };
+  }
+  // Eine Runde: erst alle Spieler (Reihenfolge der Spieler-IDs), dann der Boss. acts = { spielerId: haltung }
+  function liveStep(st, acts) {
+    if (st.end) return st;
+    const R = rng(hash32(st.seed + "|" + st.rnd)), B = st.boss, L = [], rn = st.rnd;
+    st.p.forEach(p => { p.h = (acts && STANCES[acts[p.i]]) ? acts[p.i] : "b"; });
+    for (const p of st.p) {
+      if (p.hp <= 0 || B.hp <= 0) continue; const sm = stanceMod(p.h);
+      for (let k = 0; k < p.na && B.hp > 0; k++) {
+        const roll = R.int(20), crit = roll === 20, hit = roll !== 1 && (crit || roll + p.ab + sm.ab >= B.ac);
+        if (hit) { const dmg = Math.max(1, R.int(p.dd) * (crit ? 2 : 1) + p.dm); B.hp = Math.max(0, B.hp - dmg); L.push("R" + rn + ": " + p.n + " trifft" + (crit ? " kritisch" : "") + " für " + dmg + " Schaden, " + B.n + " hat " + B.hp + " TP."); }
+        else L.push("R" + rn + ": " + p.n + " verfehlt.");
+      }
+    }
+    if (B.hp > 0) for (let k = 0; k < B.na; k++) {
+      const live = st.p.filter(p => p.hp > 0); if (!live.length) break;
+      const t = live[R.int(live.length) - 1], sm = stanceMod(t.h), roll = R.int(20), crit = roll === 20, hit = roll !== 1 && (crit || roll + B.ab >= t.ac + sm.ac);
+      if (hit) { const dmg = Math.max(1, R.int(B.dd) * (crit ? 2 : 1) + B.dm); t.hp = Math.max(0, t.hp - dmg); L.push("R" + rn + ": " + B.n + " trifft " + t.n + " für " + dmg + " Schaden" + (t.hp ? "." : ", " + t.n + " geht zu Boden.")); }
+      else L.push("R" + rn + ": " + B.n + " verfehlt " + t.n + ".");
+    }
+    st.lines = st.lines.concat(L).slice(-60);
+    if (B.hp <= 0) st.end = "win"; else if (!st.p.some(p => p.hp > 0)) st.end = "loss"; else if (rn >= LIVE_ROUNDS) st.end = "draw";
+    st.rnd++; return st;
+  }
+  // Zustand aus Start und Protokoll { runde: { id: haltung } } bis zur offenen Runde rebuilden
+  function liveReplay(party, seed, wk, bossName, acts, upto) {
+    const st = liveInit(party, seed, wk, bossName); for (let r = 1; r < upto && !st.end; r++) liveStep(st, acts[r] || {}); return st;
+  }
+  return { LIVE_MIN, LIVE_MAX, LIVE_ROUNDS, LIVE_TIME, LIVE_KOSTEN, liveInit, liveStep, liveReplay, sha256, hmac, utf8, unutf8, hex, unhex, b64u, unb64u, keyFrom, groupId, pack, unpack, rng, hash32, weekId, monthId, prevMonthId, snapOk, STANCES, duel, bossStats, bossFight, BOSS_PTS_MAX, cardOk, raidFoe, raidRun, raidState, RAID_MIN, RAID_POOL, RAID_ROOMS, ranking, sortBy, groupTotals, BRIEF_TAGE, serial, qr };
 })();
 /* MP-CORE-END */
 // ---------- Multiplayer-MVP (10.11., Sebastian): Freundes-Modus ohne Server ----------
@@ -8203,8 +8239,130 @@ const MPX = (() => {
     return MP.ranking(cards, MP.weekId(now()), MP.monthId(now()));
   }
   const monthName = m => ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"][(m % 100) - 1] + " " + Math.floor(m / 100);
+  /* MP-LIVE-UI */
+  // ---- Live-Raid (11.11.): Lobby ueber den Server (Firestore, gleicher Weg wie der Online-Abgleich), alle rechnen den Kampf selbst nach ----
+  // Dokumente unter runden/{Kennung}/karten: Lp-RAUM-ID = Spieler (Schnappschuss, Bereit, gewaehlte Haltungen), Lg-RAUM = Host (Start, Seed, Protokoll). Der Host schliesst die Runden.
+  const LV = { room: "", host: false, p: {}, g: null, st: null, me: { a: {}, rd: 0 }, busy: false, err: "", sig: "", tick: 0, roundSeen: 0, roundAt: 0, paid: "" };
+  const lvUrl = (r, id) => fbBase(r) + "/" + id + "?key=" + encodeURIComponent(FB.apiKey);
+  const lvHdr = { "Content-Type": "application/json" };
+  async function lvPut(r, id, type, obj) {
+    const res = await fetch(lvUrl(r, id), { method: "PATCH", headers: lvHdr, body: JSON.stringify({ fields: { code: { stringValue: MP.pack(type, obj, r.key) }, t: { integerValue: String(now()) }, rm: { stringValue: LV.room } } }) });
+    if (!res.ok) throw new Error("Senden " + res.status);
+  }
+  async function lvDel(r, id) { try { await fetch(lvUrl(r, id), { method: "DELETE" }); } catch (e) {} }
+  async function lvFetch(r) {
+    const base = fbBase(r), q = "key=" + encodeURIComponent(FB.apiKey); let docs = null;
+    try {
+      const res = await fetch(base.replace(/\/karten$/, "") + ":runQuery?" + q, { method: "POST", headers: lvHdr, body: JSON.stringify({ structuredQuery: { from: [{ collectionId: "karten" }], where: { fieldFilter: { field: { fieldPath: "rm" }, op: "EQUAL", value: { stringValue: LV.room } } } } }) });
+      if (res.ok) docs = (await res.json()).map(x => x.document).filter(Boolean);
+    } catch (e) {}
+    if (!docs) { const res = await fetch(base + "?pageSize=300&" + q); if (!res.ok) throw new Error("Abrufen " + res.status); docs = (await res.json()).documents || []; }
+    const out = [];
+    docs.forEach(d => { const c = d.fields && d.fields.code && d.fields.code.stringValue; if (!c) return; const u = MP.unpack(c, [r.key]); if (u.ok && (u.type === "P" || u.type === "G") && u.obj && u.obj.r === LV.room && now() - (u.obj.t || 0) < 6 * 3600e3) out.push(u); });
+    return out;
+  }
+  const lvId = () => mp().pid, lvInParty = () => !!(LV.g && LV.g.party && LV.g.party.some(p => p.i === lvId()));
+  function lvRecompute() {
+    const g = LV.g; LV.st = null; if (!g || g.st !== "fight") return;
+    try { LV.st = MP.liveReplay(g.party, g.seed, g.wk, g.bn, g.acts || {}, g.rnd); } catch (e) { LV.err = "Kampfstand nicht lesbar."; }
+    if (g.rnd !== LV.roundSeen) { LV.roundSeen = g.rnd; LV.roundAt = Date.now(); }
+  }
+  function lvGoodG(g) {
+    if (!g || g.st !== "lobby" && g.st !== "fight" || typeof g.h !== "string") return false;
+    if (g.st === "lobby") return true;
+    return Array.isArray(g.party) && g.party.length >= MP.LIVE_MIN && g.party.length <= MP.LIVE_MAX && g.party.every(p => typeof p.i === "string" && /^[A-Z2-9]{6}$/.test(p.i) && !MP.snapOk(p.s)) && Number.isInteger(g.rnd) && g.rnd >= 1 && g.rnd <= 40 && typeof g.seed === "string" && g.seed.length < 40 && Number.isInteger(g.wk) && g.acts && typeof g.acts === "object";
+  }
+  async function lvSendP() { const r = rd(); if (!r || !LV.room) return; await lvPut(r, "Lp-" + LV.room + "-" + lvId(), "P", { r: LV.room, i: lvId(), n: myName(), s: mySnap(), a: LV.me.a, rd: LV.me.rd, t: now() }); }
+  async function lvPoll() {
+    const r = rd(); if (!r || !LV.room || LV.busy) return; LV.busy = true;
+    try {
+      const list = await lvFetch(r), p = {}; let g = null;
+      list.forEach(u => { if (u.type === "P" && typeof u.obj.i === "string" && !MP.snapOk(u.obj.s)) p[u.obj.i] = u.obj; if (u.type === "G" && lvGoodG(u.obj) && (!g || u.obj.t > g.t)) g = u.obj; });
+      LV.p = p; if (g) LV.g = g; else if (!LV.host && LV.g) { LV.err = "Der Host hat den Raum geschlossen."; LV.room = ""; LV.g = null; }
+      lvRecompute(); LV.err = LV.err === "Kampfstand nicht lesbar." ? LV.err : "";
+      if (LV.g && LV.g.st === "fight" && lvInParty() && LV.paid !== LV.g.seed) { LV.paid = LV.g.seed; S.need[1] = Math.max(0, S.need[1] - MP.LIVE_KOSTEN); save2(); }
+      if (LV.host) await lvHostTick(r);
+    } catch (e) { LV.err = "Server nicht erreichbar (" + (e && e.message || "offline") + "), ich versuche es weiter."; }
+    LV.busy = false; lvRefresh();
+  }
+  async function lvHostTick(r) {
+    const g = LV.g, st = LV.st; if (!g || g.st !== "fight" || !st || st.end) return;
+    const acts = {}; let all = true;
+    st.p.filter(p => p.hp > 0).forEach(p => { const a = p.i === lvId() ? LV.me.a : (LV.p[p.i] && LV.p[p.i].a), v = a && a[g.rnd]; if (v && MP.STANCES[v]) acts[p.i] = v; else all = false; });
+    if (!all && now() - g.t0 < MP.LIVE_TIME) return;
+    const ng = Object.assign({}, g, { acts: Object.assign({}, g.acts, { [g.rnd]: acts }), rnd: g.rnd + 1, t0: now(), t: now() });
+    await lvPut(r, "Lg-" + LV.room, "G", ng); LV.g = ng; lvRecompute();
+  }
+  function lvRefresh() {
+    const sig = JSON.stringify([LV.room, LV.g && [LV.g.st, LV.g.rnd, LV.g.t], Object.values(LV.p).map(x => [x.i, x.rd, Object.keys(x.a || {}).length]), LV.err, LV.me.rd, Object.keys(LV.me.a).length]);
+    if (sig !== LV.sig) { LV.sig = sig; if (!$o.hidden && U.tab === "live") render(); }
+  }
+  function lvTimer() { const e = document.getElementById("mpTm"); if (e && LV.g && LV.g.st === "fight") e.textContent = Math.max(0, Math.ceil((MP.LIVE_TIME - (Date.now() - LV.roundAt)) / 1000)); }
+  function lvStartLoop() { if (LV.tick) return; LV.tick = setInterval(() => { if (LV.room) { lvPoll(); lvTimer(); } }, 1500); setInterval(lvTimer, 500); }
+  async function lvOpen() {
+    const r = rd(); if (!r) return fail("Zuerst eine Runde anlegen."); if (!fbOn()) return fail("Live braucht den Server.");
+    const A = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; let room = ""; for (let i = 0; i < 4; i++) room += A[Math.floor(Math.random() * A.length)];
+    if (S.need[1] < MP.LIVE_KOSTEN) return fail("Zu wenig Energie (" + MP.LIVE_KOSTEN + " nötig).");
+    Object.assign(LV, { room, host: true, p: {}, g: null, st: null, me: { a: {}, rd: 1 }, err: "", sig: "", paid: "" });
+    try { await lvPut(r, "Lg-" + room, "G", { r: room, h: lvId(), st: "lobby", t: now() }); await lvSendP(); } catch (e) { LV.room = ""; return fail("Raum konnte nicht eröffnet werden (" + e.message + ")."); }
+    lvStartLoop(); U.msg = "Raum " + room + " ist offen. Teile den Code mit deiner Runde.";
+  }
+  async function lvJoin(code) {
+    const r = rd(); if (!r) return fail("Zuerst eine Runde anlegen."); code = String(code || "").trim().toUpperCase(); if (!/^[A-Z2-9]{4}$/.test(code)) return fail("Der Raumcode hat 4 Zeichen.");
+    Object.assign(LV, { room: code, host: false, p: {}, g: null, st: null, me: { a: {}, rd: 0 }, err: "", sig: "", paid: "" });
+    try { const list = await lvFetch(r), g = list.filter(u => u.type === "G" && lvGoodG(u.obj)).map(u => u.obj)[0];
+      if (!g) { LV.room = ""; return fail("Raum " + code + " nicht gefunden (nur Mitglieder derselben Runde sehen ihn)."); }
+      LV.g = g; await lvSendP(); } catch (e) { LV.room = ""; return fail("Beitritt fehlgeschlagen (" + e.message + ")."); }
+    lvRecompute(); lvStartLoop(); U.msg = "Du bist im Raum " + code + ".";
+  }
+  async function lvReady() {
+    if (S.need[1] < MP.LIVE_KOSTEN) return fail("Zu wenig Energie (" + MP.LIVE_KOSTEN + " nötig).");
+    LV.me.rd = 1; try { await lvSendP(); } catch (e) { LV.me.rd = 0; fail("Senden fehlgeschlagen (" + e.message + ")."); }
+  }
+  async function lvStart() {
+    const r = rd(); if (!LV.host || !LV.g || LV.g.st !== "lobby") return;
+    const party = [{ i: lvId(), n: myName(), s: mySnap() }]; Object.values(LV.p).filter(x => x.i !== lvId() && x.rd === 1).forEach(x => party.push({ i: x.i, n: String(x.n || "").slice(0, 20), s: x.s }));
+    party.sort((a, b) => (a.i < b.i ? -1 : 1)); if (party.length < MP.LIVE_MIN) return fail("Mindestens " + MP.LIVE_MIN + " Spieler müssen bereit sein."); if (party.length > MP.LIVE_MAX) party.length = MP.LIVE_MAX;
+    const wk = MP.weekId(now()), g = { r: LV.room, h: lvId(), st: "fight", party, seed: LV.room + "-" + MP.hash32(now() + "|" + Math.random()), wk, bn: raidBoss(wk).n, rnd: 1, acts: {}, t0: now(), t: now() };
+    try { await lvPut(r, "Lg-" + LV.room, "G", g); LV.g = g; lvRecompute(); } catch (e) { fail("Start fehlgeschlagen (" + e.message + ")."); }
+  }
+  async function lvAct(s) { if (!LV.g || LV.g.st !== "fight" || !LV.st || LV.st.end || !MP.STANCES[s]) return; LV.me.a[LV.g.rnd] = s; try { await lvSendP(); } catch (e) { fail("Senden fehlgeschlagen (" + e.message + ")."); } }
+  async function lvLeave() {
+    const r = rd(), room = LV.room; if (r && room) { await lvDel(r, "Lp-" + room + "-" + lvId()); if (LV.host) await lvDel(r, "Lg-" + room); }
+    Object.assign(LV, { room: "", host: false, p: {}, g: null, st: null, me: { a: {}, rd: 0 }, err: "", sig: "" });
+  }
+  function lvLoot() {
+    const m = mp(), g = LV.g, k = "LV:" + (g && g.seed); if (!g || !LV.st || LV.st.end !== "win" || !lvInParty() || m.used[k]) return fail("Keine Beute offen.");
+    m.used[k] = now(); m.flags.lv1 = 1; gainLoot(true, null, 2); log("Live-Raid gegen " + g.bn + " gewonnen, Beute geholt.", "x"); save2(); updateSheet(); checkAch(); U.msg = "Beute geholt, sie steht im Rucksack.";
+  }
+  function viewLive() {
+    const r = rd(); if (!r) return '<p class="note">Erst eine Runde anlegen.</p>'; if (!fbOn()) return '<p class="mpmsg">Live braucht den Server (Online-Abgleich).</p>';
+    const head = "<h3>Live-Raid</h3>", err = LV.err ? '<p class="mpmsg">' + esc(LV.err) + "</p>" : "";
+    if (!LV.room) return head + "<p>2 bis " + MP.LIVE_MAX + " Spieler der Runde \"" + esc(r.name) + "\" kämpfen gleichzeitig gegen einen Boss. Jede Runde wählt jeder seine Haltung (" + MP.LIVE_TIME / 1000 + " Sekunden Zeit). Kosten " + MP.LIVE_KOSTEN + " Energie.</p>" + err +
+      '<p><button data-a="lopen">Raum eröffnen</button></p><p>Raumcode <input id="mpLr" maxlength="4" size="6" placeholder="ABCD"> <button data-a="ljoin">Beitreten</button></p><p class="note">Der Host eröffnet den Raum und startet den Kampf, wenn alle bereit sind. Die Spieler müssen in derselben Runde sein (gleicher Name und Passwort).</p>';
+    const g = LV.g, st = LV.st, row = (n, c, extra) => '<tr><td>' + esc(n) + ' <span class="lab">' + esc(c) + "</span></td><td>" + extra + "</td></tr>";
+    if (!g || g.st === "lobby") {
+      const ps = [{ i: lvId(), n: myName(), s: mySnap(), rd: LV.me.rd }].concat(Object.values(LV.p).filter(x => x.i !== lvId())), ready = ps.filter(x => x.rd === 1).length;
+      return head + "<p>Raum <b>" + esc(LV.room) + "</b> in der Runde \"" + esc(r.name) + "\". " + (LV.host ? "Du bist Host." : "Warte auf den Start durch den Host.") + "</p>" + err +
+        '<table class="mpt">' + ps.map(x => row(x.n, cName(x.s.c) + " Lv " + x.s.l, x.rd === 1 ? "bereit" : "wartet")).join("") + "</table>" +
+        "<p>" + (LV.me.rd ? "" : '<button data-a="lready">Bereit (' + MP.LIVE_KOSTEN + " Energie)</button> ") + (LV.host ? '<button data-a="lstart"' + (ready < MP.LIVE_MIN ? " disabled" : "") + ">Kampf starten (" + ready + " bereit)</button> " : "") + '<button data-a="lleave">Raum verlassen</button></p>';
+    }
+    if (!st) return head + err + "<p>Kampf wird geladen …</p>";
+    const B = st.boss, inP = lvInParty(), me = st.p.find(p => p.i === lvId()), myA = LV.me.a[g.rnd];
+    let h = head + "<p><b>" + esc(B.n) + "</b> · Raum " + esc(LV.room) + "</p>" + err + '<div class="mpbar" aria-label="Boss-TP"><i style="width:' + Math.round(100 * B.hp / B.max) + '%"></i></div><p class="note">Boss ' + B.hp + " / " + B.max + " TP, RK " + B.ac + ", " + B.na + " Angriffe</p>" +
+      '<table class="mpt">' + st.p.map(p => row(p.n + (p.i === lvId() ? " (du)" : ""), p.hp > 0 ? "" : "am Boden", p.hp + " / " + p.max + " TP")).join("") + "</table>";
+    if (!st.end) {
+      h += "<p><b>Runde " + g.rnd + "</b> · noch <span id=\"mpTm\">" + MP.LIVE_TIME / 1000 + "</span> s</p>";
+      if (inP && me && me.hp > 0) h += '<div class="row">' + Object.entries(MP.STANCES).map(([k, v]) => '<button data-a="lact" data-s="' + k + '" aria-pressed="' + (myA === k) + '">' + v + "</button>").join("") + '</div><p class="note">' + (myA ? "Gewählt: " + MP.STANCES[myA] + ". Der Host wertet die Runde aus, sobald alle gewählt haben oder die Zeit abläuft (dann gilt Ausgewogen)." : "Angriff: +2 Treffer, −2 RK. Vorsicht: −2 Treffer, +2 RK.") + "</p>";
+      else h += '<p class="note">' + (inP ? "Du liegst am Boden, schau den anderen zu." : "Du schaust zu.") + "</p>";
+    } else {
+      h += '<div class="mpout"><h3>' + (st.end === "win" ? "Sieg!" : st.end === "loss" ? "Niederlage" : "Unentschieden: die Zeit ist abgelaufen") + "</h3>" + (st.end === "win" && inP ? (mp().used["LV:" + g.seed] ? '<p class="note">Beute geholt.</p>' : '<p><button data-a="lloot">Beute abholen</button></p>') : "") + "</div>";
+    }
+    h += '<div class="mplog">' + st.lines.slice(-10).map(l => "<p>" + esc(l) + "</p>").join("") + '</div><p><button data-a="lleave">' + (st.end ? "Raum schließen" : "Raum verlassen") + "</button></p>";
+    return h;
+  }
   // ---- Darstellung ----
-  const TABS = [["runde", "Runde"], ["duell", "Duell"], ["boss", "Wochenboss"], ["raid", "Raid"], ["tausch", "Tausch"], ["rang", "Rangliste"]];
+  const TABS = [["runde", "Runde"], ["duell", "Duell"], ["boss", "Wochenboss"], ["raid", "Raid"], ["live", "Live"], ["tausch", "Tausch"], ["rang", "Rangliste"]];
   const stanceSel = id => '<select id="' + id + '">' + Object.entries(MP.STANCES).map(([k, v]) => '<option value="' + k + '"' + (k === "b" ? " selected" : "") + ">" + v + "</option>").join("") + "</select>";
   const gbOptions = () => { const r = rd(); return r ? Object.entries(r.gb).filter(([id]) => id !== mp().pid).map(([id, g]) => '<option value="' + id + '">' + esc(g.n) + " (" + esc(cName(g.c)) + ")</option>").join("") : ""; };
   const itemOptions = pred => tradeList().map((e, i) => ({ e, i })).filter(x => pred(x.e.it)).map(x => '<option value="' + x.i + '">' + esc(x.e.it.n) + " (" + RAR[x.e.it.r] + (x.e.src === "chest" ? ", Truhe" : "") + ")</option>").join("");
@@ -8227,6 +8385,7 @@ const MPX = (() => {
   }
   function viewTab() {
     const m = mp(), r = rd(), wk = MP.weekId(now()), d = duelRoll();
+    if (U.tab === "live") return viewLive();
     if (U.tab === "runde") {
       return '<h3>Spieler</h3><p>Name <input id="mpName" maxlength="20" value="' + esc(m.name) + '" placeholder="Spieler"> <button data-a="name">Speichern</button></p><p class="note">Deine Spieler-ID: <b>' + m.pid + "</b> (gilt für alle Figuren dieses Kontos). Die ID brauchen Freunde, wenn sie dir etwas schicken.</p>" +
         "<h3>Runden</h3>" + (m.runden.length ? m.runden.map((x, i) => '<div class="beg-row"><span>' + (i === m.act ? "● " : "○ ") + esc(x.name) + ' <span class="lab">' + (Object.keys(x.gb).filter(k => k !== m.pid).length + 1) + " Spieler (du mitgezählt) · Kennung " + x.gid + "</span></span><span>" + (i === m.act ? "" : '<button data-a="act" data-i="' + i + '">Aktiv</button> ') + (U.conf === i ? '<button data-a="leave" data-i="' + i + '">Ja, verlassen</button> <button data-a="noleave">Abbrechen</button>' : '<button data-a="ask" data-i="' + i + '">Verlassen</button>') + "</span></div>").join("") : '<p class="note">Noch keine Runde.</p>') +
@@ -8321,6 +8480,13 @@ const MPX = (() => {
     else if (a === "wb") fightWeekBoss(val("mpWbSt") || "b");
     else if (a === "raid") fightRaid(val("mpRdSt") || "b");
     else if (a === "raidloot") claimRaid();
+    else if (a === "lopen") { lvOpen().then(render); return; }
+    else if (a === "ljoin") { lvJoin(val("mpLr")).then(render); return; }
+    else if (a === "lready") { lvReady().then(render); return; }
+    else if (a === "lstart") { lvStart().then(render); return; }
+    else if (a === "lact") { lvAct(b.dataset.s).then(render); render(); return; }
+    else if (a === "lleave") { lvLeave().then(render); return; }
+    else if (a === "lloot") lvLoot();
     else if (a === "card") shareCard();
     else if (a === "wert") U.wert = b.dataset.k;
     else if (a === "gift" || a === "offer") { const g = a === "gift"; newOffer(g ? "B" : "T", +val(g ? "mpGi" : "mpSi"), (val(g ? "mpGid" : "mpSid").trim().toUpperCase()) || val(g ? "mpGt" : "mpSt")); }
@@ -8342,8 +8508,9 @@ const MPX = (() => {
     { id: "mp_brief", n: "Briefträger", d: "Den ersten Tauschbrief verschickt.", hint: "Menü Runde, Reiter Tausch: einen Gegenstand verschenken.", ok: () => !!(KONTO.mp && KONTO.mp.flags && KONTO.mp.flags.b1) },
     { id: "mp_woche", n: "Wochenbezwinger", d: "Einen Wochenboss besiegt.", hint: "Menü Runde, Reiter Wochenboss.", ok: () => !!(KONTO.mp && KONTO.mp.flags && KONTO.mp.flags.w1) },
     { id: "mp_raid", n: "Raidgruppe", d: "Mit der Runde einen Wochen-Raid-Boss besiegt und die Beute geholt.", hint: "Menü Runde, Reiter Raid: mindestens vier Charaktere müssen mitmachen.", ok: () => !!(KONTO.mp && KONTO.mp.flags && KONTO.mp.flags.rd1) },
+    { id: "mp_live", n: "Gemeinsam gegen den Boss", d: "Einen Live-Raid mit anderen Spielern gewonnen.", hint: "Menü Runde, Reiter Live: Raum eröffnen oder beitreten.", ok: () => !!(KONTO.mp && KONTO.mp.flags && KONTO.mp.flags.lv1) },
     { id: "mp_gv", n: "Gemeinsam vollständig", d: "Ein Set per Tausch komplettiert.", hint: "Tausche Set-Teile mit Freunden, bis ein Set vollständig ist.", ok: () => !!(KONTO.mp && KONTO.mp.flags && KONTO.mp.flags.gv) });
-  return { mp, redeem, mySnap, myCard, U, render, newChallenge, fightChallenge, fightWeekBoss, newOffer, answerOffer, tradeList, takeSiegel };
+  return { mp, redeem, mySnap, myCard, U, render, newChallenge, fightChallenge, fightWeekBoss, newOffer, answerOffer, tradeList, takeSiegel, LV, lvOpen, lvJoin, lvReady, lvStart, lvAct, lvPoll, lvLoot, lvLeave };
 })();
 window.MPX = MPX; window.MP = MP;
 // MP-BLOCK-END
