@@ -8007,7 +8007,7 @@ const MPX = (() => {
     m.runden.push({ name, key, pw: String(pw), gid: MP.groupId(key), cards: {}, gb: {} }); m.act = m.runden.length - 1; save2(); U.msg = "Runde \"" + name + "\" angelegt. Die Freunde geben denselben Namen und dasselbe Passwort ein.";
   }
   // ---- Einladung per Link (WhatsApp): Name und Passwort der Runde stecken im Teil hinter dem # des Links, der nie an einen Server geht ----
-  const BASE = "https://sebastiansteenbock-web.github.io/buddymon-pwa/";
+  const BASE = "https://sebastiansteenbock-web.github.io/Buddymon-pwa/";
   const inviteLink = r => BASE + "#einladung=" + MP.b64u(MP.utf8(JSON.stringify({ n: r.name, p: r.pw, k: MP.pack("K", myCard(), r.key) })));
   function makeInvite(pw) {
     const r = rd(); if (!r) return fail("Zuerst eine Runde anlegen.");
